@@ -1,3 +1,5 @@
+// Package watch implements watching of templates on the filesystem. When a write event occurs,
+// the watched template is reread, rebuilt, and is ready for use.
 package watch
 
 import (
@@ -7,22 +9,27 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/fsnotify/fsnotify"
+	"path/filepath"
 )
 
+// HTML and watches HTML template files for write events. If a write is received,
+// the template is reread from the filesystem, and recompiles. If no error occurs,
+// the old template is replaced with the new one.
 type HTML struct {
-	files     map[string]htmlTmplFuncPair // { template, func map } set is mapped to path string
-	lock      sync.RWMutex                // make map thread safe
-	watcher   *fsnotify.Watcher           // to watch for changes in the files
-	done      chan struct{}               // to signal done and cleanup
+	files     map[string]htmlTmplFuncPair // { template, func map } pair is mapped to path string
+	lock      sync.RWMutex                // files map lock
+	watcher   *fsnotify.Watcher           // watches for changes in the files
+	done      chan struct{}               // signals done and cleanup
 	closeOnce sync.Once                   // only allow sending on done channel once
 }
 
+// htmlTmplFuncPair keeps the HTML template and its FuncMap together.
 type htmlTmplFuncPair struct {
 	Template *template.Template
 	FuncMap  template.FuncMap
 }
 
-// HTMLFiles builds a new HTML file template watcher.
+// HTMLFiles builds and initializes a new HTML file template watcher.
 func HTMLFiles() (*HTML, error) {
 	hfile := new(HTML)
 
@@ -38,28 +45,30 @@ func HTMLFiles() (*HTML, error) {
 	return hfile, nil
 }
 
-// AddFiles adds the files to be watched. It returns an error if a file does not exist,
-// or if there was a problem parsing the template.
+// AddFiles adds the HTML template files to be watched. It returns an error if
+// a file does not exist, or if there was a problem parsing the template. If an
+// error occurs, the template is not added.
 func (hfile *HTML) AddFiles(paths ...string) error {
 	cntxLog := log.WithFields(log.Fields{
-		"func":  "watch.HTML.AddFiles",
-		"paths": paths,
+		"func": "watch.HTML.AddFiles",
 	})
 
 	for i := range paths {
 		cntxLog = cntxLog.WithField("path", paths[i])
-		cntxLog.Debug("parsing template")
-		tmpl, err := template.New(paths[i]).ParseFiles(paths[i])
+		cntxLog.Debugf("parsing template %d", i)
+		tmpl, err := template.New(filepath.Base(paths[i])).ParseFiles(paths[i])
 		if err != nil {
+			cntxLog.WithError(err).Error("error parsing template")
 			return err
 		}
 
 		cntxLog.Debug("adding file to watcher")
 		if err := hfile.watcher.Add(paths[i]); err != nil {
+			cntxLog.WithError(err).Error("error adding file to watcher")
 			return err
 		}
 
-		cntxLog.Debug("adding html tmpl pair to inner map")
+		cntxLog.Debug("adding html tmpl pair to map")
 		hfile.lock.Lock()
 		hfile.files[paths[i]] = htmlTmplFuncPair{Template: tmpl}
 		hfile.lock.Unlock()
@@ -68,16 +77,29 @@ func (hfile *HTML) AddFiles(paths ...string) error {
 	return nil
 }
 
-// AddFileWithFunc adds the file to be watched, with its corresponding function map. It
-// returns an error if a file does not exist, or if there was a problem parsing the template.
+// AddFileWithFunc adds the template file to be watched, with a function map.
+// An error is returned if the file at the path given does not exist,
+// or if there was a problem parsing the template.
 func (hfile *HTML) AddFileWithFunc(path string, funcMap template.FuncMap) error {
-	tmpl, err := template.New(path).Funcs(funcMap).ParseFiles(path)
+	cntxLog := log.WithFields(log.Fields{
+		"func": "watch.HTML.AddFileWithFunc",
+		"path": path,
+	})
+
+	cntxLog.Debug("parsing template")
+	// use filpath.Base to use basename of path for template name, because if template
+	// name doesn't match path basename, when using ParseFiles, ExecuteTemplate must
+	// explicitly be used when executing the template (Execute will fail)
+	tmpl, err := template.New(filepath.Base(path)).Funcs(funcMap).ParseFiles(path)
 	if err != nil {
-		return err
+		cntxLog.Error(err)
+		return ParseTmplErr
 	}
 
+	cntxLog.Debug("adding file to watcher")
 	if err := hfile.watcher.Add(path); err != nil {
-		return err
+		cntxLog.Error(err)
+		return AddFileErr
 	}
 
 	hfile.lock.Lock()
@@ -87,12 +109,14 @@ func (hfile *HTML) AddFileWithFunc(path string, funcMap template.FuncMap) error 
 	return nil
 }
 
-// File gets a template file that is being watched. If a path is given for a file
-// that is not being watched, a nil pointer is returned, with an os.ErrNotExist error.
+// File returns the parsed template for the file being watched at the given path.
+// If a path is given for a file that is not being watched, a nil pointer is returned,
+// with an os.ErrNotExist error.
 func (hfile *HTML) File(path string) (*template.Template, error) {
 	hfile.lock.RLock()
 	t, ok := hfile.files[path]
 	hfile.lock.RUnlock()
+
 	if !ok {
 		return nil, os.ErrNotExist
 	}
@@ -108,33 +132,19 @@ func (hfile *HTML) Watch() {
 		"func": "watch.HTML.Watch",
 	})
 
-	cntxLog.Warn("beginning watch")
-	log.SetLevel(log.DebugLevel)
+	cntxLog.Debug("beginning watch")
 
 	for {
 		select {
 		case event := <-hfile.watcher.Events:
 			cntxLog := cntxLog.WithFields(log.Fields{
-				"eventName": event.Name,
-				"eventOp":   event.Op,
+				"path": event.Name,
+				"op":   event.Op,
 			})
 
 			cntxLog.Debug("got event")
 
-			/*
-				if event.Op&fsnotify.Remove == fsnotify.Remove {
-					for i := 0; i < 3; i++ {
-						if err := hfile.watcher.Add(event.Name); err != nil {
-							cntxLog.WithError(err).Error("error adding after remove event")
-							time.Sleep(250 * time.Millisecond)
-						} else {
-							break
-						}
-					}
-					continue
-				}*/
-
-			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Remove == fsnotify.Remove {
+			if event.Op&fsnotify.Write == fsnotify.Write {
 
 				hfile.lock.RLock()
 				pair, ok := hfile.files[event.Name]
@@ -150,9 +160,9 @@ func (hfile *HTML) Watch() {
 				var tmpl *template.Template
 				var err error
 				if pair.FuncMap != nil {
-					tmpl, err = template.New(event.Name).Funcs(pair.FuncMap).ParseFiles(event.Name)
+					tmpl, err = template.New(filepath.Base(event.Name)).Funcs(pair.FuncMap).ParseFiles(event.Name)
 				} else {
-					tmpl, err = template.New(event.Name).ParseFiles(event.Name)
+					tmpl, err = template.New(filepath.Base(event.Name)).ParseFiles(event.Name)
 				}
 
 				if err != nil {
@@ -165,11 +175,6 @@ func (hfile *HTML) Watch() {
 				hfile.lock.Unlock()
 
 				cntxLog.Info("template compiled")
-
-				if err := hfile.watcher.Add(event.Name); err != nil {
-					cntxLog.WithError(err).Error("error adding after remove event")
-				}
-
 			}
 		case <-hfile.done:
 			if err := hfile.watcher.Close(); err != nil {
